@@ -16,6 +16,18 @@ FILTER_LABELS = {"cross": "Cross", "x": "X"}
 EXPECTED_LABELS = {"+": "Cross", "x": "X"}
 
 
+class UnsupportedSizeError(ValueError):
+    """JSON 패턴 키의 크기에 해당하는 필터를 지원하지 않는다."""
+
+
+def normalize_label(raw_label, label_map, field):
+    """필터 키나 정답에 쓰인 라벨을 내부 표준 라벨로 변환한다."""
+    if not isinstance(raw_label, str) or raw_label not in label_map:
+        allowed = " 또는 ".join(repr(label) for label in label_map)
+        raise ValueError(f"{field} 값은 {allowed}여야 합니다.")
+    return label_map[raw_label]
+
+
 def mac(pattern, weights):
     """크기가 같은 두 행렬에서 같은 위치의 값끼리 곱해 누적한다."""
     score = 0.0
@@ -48,12 +60,14 @@ def read_matrix(label):
                 raise ValueError
         except (ValueError, OverflowError):
             print("입력 형식 오류: 각 줄에 유한한 숫자 3개를 공백으로 구분해 입력하세요.")
+            print("잘못된 입력 예: '1 0' 또는 '1 a 0'. 올바른 입력 예: '1 0 1'.")
             continue
         matrix.append(row)
     return matrix
 
 
 def time_mac(pattern, weights):
+    mac(pattern, weights)  # 워밍업 1회는 측정에서 제외한다.
     elapsed_ns = 0
     for _ in range(REPEATS):
         before = perf_counter_ns()
@@ -135,8 +149,10 @@ def load_filters(filters):
         try:
             group = require_object(filters.get(key), f"filters.{key}")
             loaded[key] = {
-                label: validate_matrix(group.get(raw_label), size, f"{key}.{raw_label}")
-                for raw_label, label in FILTER_LABELS.items()
+                normalize_label(raw_label, FILTER_LABELS, "필터 키"): validate_matrix(
+                    group.get(raw_label), size, f"{key}.{raw_label}"
+                )
+                for raw_label in FILTER_LABELS
             }
         except ValueError as error:
             errors[key] = str(error)
@@ -149,21 +165,18 @@ def load_filters(filters):
 def evaluate_case(case_id, case, filters, filter_errors):
     match = PATTERN_KEY.fullmatch(case_id)
     if match is None:
-        raise ValueError("패턴 키는 size_{N}_{idx} 형식이어야 합니다.")
+        raise ValueError("패턴 키는 size_{N}_{idx} 형식이어야 합니다. 예: size_13_2")
     size_text = match.group(1)
     filter_key = f"size_{size_text}"
     if filter_key in filter_errors:
         raise ValueError(f"필터 오류: {filter_errors[filter_key]}")
     if filter_key not in filters:
-        raise ValueError(f"지원하지 않는 패턴 크기: {size_text}")
+        raise UnsupportedSizeError(f"지원하지 않는 패턴 크기: {size_text} (MAC 건너뜀)")
 
     size = int(size_text)
     case = require_object(case, case_id)
     pattern = validate_matrix(case.get("input"), size, "input")
-    raw_expected = case.get("expected")
-    if not isinstance(raw_expected, str) or raw_expected not in EXPECTED_LABELS:
-        raise ValueError("expected 값은 '+' 또는 'x'여야 합니다.")
-    expected = EXPECTED_LABELS[raw_expected]
+    expected = normalize_label(case.get("expected"), EXPECTED_LABELS, "expected")
 
     weights = filters[filter_key]
     cross_score = mac(pattern, weights["Cross"])
@@ -173,21 +186,29 @@ def evaluate_case(case_id, case, filters, filter_errors):
     result = decide(cross_score, x_score, "Cross", "X")
     if result == expected:
         print(f"판정: {result} | expected: {expected} | PASS")
-        return None
+        return result, None
 
     if result == "UNDECIDED":
         reason = f"동점 처리 (|Cross-X| < {EPSILON:g}, expected: {expected})"
     else:
         reason = f"판정과 expected 불일치 ({result} / {expected})"
     print(f"판정: {result} | expected: {expected} | FAIL ({reason})")
-    return reason
+    return result, reason
 
 
-def print_summary(total, failures):
+def print_summary(total, failures, undecided, skipped):
+    failed = len(failures)
+    passed = total - failed
     print("\n[결과 요약]")
     print(f"총 테스트: {total}개")
-    print(f"통과: {total - len(failures)}개")
-    print(f"실패: {len(failures)}개")
+    print(f"통과: {passed}개")
+    print(f"실패: {failed}개")
+    if total:
+        print(f"통과율: {passed / total:.1%} | 실패율: {failed / total:.1%}")
+    else:
+        print("통과율: 해당 없음 | 실패율: 해당 없음")
+    print(f"동점(UNDECIDED): {undecided}개")
+    print(f"미지원 크기로 MAC 건너뜀: {skipped}개 (실패에 포함)")
     if failures:
         print("실패 케이스:")
         for case_id, reason in failures:
@@ -212,18 +233,25 @@ def run_json(path):
 
     print("\n[패턴 분석]")
     failures = []
+    undecided = 0
+    skipped = 0
     for case_id, case in patterns.items():
         print(f"\n--- {case_id} ---")
         try:
-            reason = evaluate_case(case_id, case, filters, filter_errors)
+            result, reason = evaluate_case(case_id, case, filters, filter_errors)
         except ValueError as error:
+            if isinstance(error, UnsupportedSizeError):
+                skipped += 1
             reason = str(error)
             print(f"FAIL ({reason})")
+        else:
+            if result == "UNDECIDED":
+                undecided += 1
         if reason is not None:
             failures.append((case_id, reason))
 
     print_benchmark(SIZES)
-    print_summary(len(patterns), failures)
+    print_summary(len(patterns), failures, undecided, skipped)
 
 
 def main():
